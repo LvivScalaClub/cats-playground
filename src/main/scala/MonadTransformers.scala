@@ -1,10 +1,12 @@
-import MonadTransformers.ApiError
-import MonadTransformers.Domain._
-import scala.concurrent.ExecutionContext.Implicits.global
+import cats.instances.future._
+import cats.data.EitherT
 
-import scala.concurrent.Future
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.{Await, Future}
+import scala.concurrent.duration._
 
 object MonadTransformers extends App {
+  import Domain._
 
   sealed trait ApiError
 
@@ -15,6 +17,8 @@ object MonadTransformers extends App {
   case class ApiUnavailable(msg: String) extends ApiError
 
   case class SerializationError(msg: String) extends ApiError
+
+  case class ServiceBookingError(msg: String) extends ApiError
 
   object Domain {
 
@@ -129,15 +133,65 @@ object MonadTransformers extends App {
   val username = "petro"
   val password = "password"
 
-  for {
+  val from = 8
+  val to = 18
+  val serviceName = "service_a"
+
+  type EitherTApiResp[T] = EitherT[Future, ApiError, T]
+
+  val getAuthToken = EitherT(authApi.getAuthToken(username, password))
+
+  val booking2F = for {
+    token <- EitherT(authApi.getAuthToken(username, password))
+    user <- EitherT(userApi.getUser(username, token))
+    service <- EitherT(serviceApi.getService(serviceName, token))
+    serviceAvailability <- EitherT(serviceApi.getServiceAvailability(service.id, from, to, token))
+    booking <- if (serviceAvailability.available) {
+      EitherT(bookingApi.bookService(service.id, user.id, token))
+    } else EitherT(Future.successful[Either[ApiError, Booking]](Left(ServiceBookingError("Service unavailable"))))
+  } yield booking
+
+
+  val bookingF = for {
     token <- authApi.getAuthToken(username, password)
     user <- token match {
       case Right(t) => userApi.getUser(username, t)
       case Left(err) => Future.successful(Left(err))
     }
     service <- token match {
-      case Right(t) => serviceApi.getService("test", t)
+      case Right(t) => serviceApi.getService(serviceName, t)
       case Left(err) => Future.successful(Left(err))
     }
-  } yield ()
+//    for comparision
+//    isAvailable <- service match {
+//      case Right(s) => token match {
+//        case Right(t) => serviceApi.getServiceAvailability(s.id, from, to, t)
+//        case Left(err) => Future.successful(Left(err))
+//      }
+//      case Left(err) => Future.successful(Left(err))
+//    }
+
+    isAvailable <- (service, token) match {
+      case (Right(s), Right(t)) => serviceApi.getServiceAvailability(s.id, from, to, t)
+      case (Left(err), _) => Future.successful(Left(err))
+      case (_, Left(err)) => Future.successful(Left(err))
+    }
+
+    booking <- (isAvailable, token, user, service) match {
+      case (Right(isAv), Right(t), Right(u), Right(s)) if isAv.available => bookingApi.bookService(s.id, u.id, t)
+      case (Right(isAv), Right(t), Right(u), Right(s)) if !isAv.available => Future.successful(Left(ServiceBookingError("Service unavailable")))
+      case (Left(err), _, _, _) => Future.successful(Left(err))
+      case (_, Left(err), _, _) => Future.successful(Left(err))
+      case (_, _, Left(err), _) => Future.successful(Left(err))
+      case (_, _, _, Left(err)) => Future.successful(Left(err))
+    }
+
+  } yield booking
+
+  println("bookingF")
+  println(Await.result(bookingF, 1.second))
+  println()
+
+  println("booking2F")
+  println(Await.result(booking2F.value, 1.second))
 }
